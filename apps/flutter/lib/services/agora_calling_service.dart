@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:agora_rtc_engine/agora_rtc_engine.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
+import 'agora_audio_capture_service.dart';
 
 /// PhaseGuard In-App Calling Service
 /// Integrates Agora RTC for high-quality audio/video calling
@@ -25,6 +27,10 @@ class AgoraCallingService extends ChangeNotifier {
   int _networkQuality = 0;
   bool _isEndingCall = false;
 
+  // Audio capture for scam detection
+  final AgoraAudioCaptureService _audioCaptureService = AgoraAudioCaptureService();
+  StreamSubscription<Uint8List>? _audioStreamSubscription;
+
   // Getters
   RtcEngine? get engine => _engine;
   bool get isInitialized => _isInitialized;
@@ -39,6 +45,7 @@ class AgoraCallingService extends ChangeNotifier {
   String get connectionState => _connectionState;
   int get networkQuality => _networkQuality;
   String? get currentCallId => _currentCallId;
+  Stream<Uint8List> get remoteAudioStream => _audioCaptureService.audioStream;
 
   /// Initialize Agora RTC Engine (Testing Mode: App ID only, no certificate needed)
   Future<void> initialize({
@@ -67,6 +74,7 @@ class AgoraCallingService extends ChangeNotifier {
           onError: (ErrorCodeType err, String msg) {
             _onError(err, msg);
           },
+          onRemoteAudioStateChanged: _onRemoteAudioStateChanged,
         ),
       );
 
@@ -266,6 +274,7 @@ class AgoraCallingService extends ChangeNotifier {
     _remoteUid = remoteUid;
     _isConnected = true;
     _startDurationTimer();
+    _startAudioCapture();
     debugPrint('👤 Remote user joined: $remoteUid');
     notifyListeners();
   }
@@ -321,6 +330,19 @@ class AgoraCallingService extends ChangeNotifier {
     debugPrint('❌ Agora error: $err - $msg');
   }
 
+  void _onRemoteAudioStateChanged(
+    RtcConnection connection,
+    int remoteUid,
+    RemoteAudioState state,
+    int reason,
+    int elapsed,
+  ) {
+    debugPrint('🎤 Remote audio state: $state for user $remoteUid');
+    if (state == RemoteAudioState.remoteAudioStatePlaying) {
+      _startAudioCapture();
+    }
+  }
+
   // ── Private Helpers ──────────────────────────────────────────────────────
 
   void _startDurationTimer() {
@@ -343,11 +365,44 @@ class AgoraCallingService extends ChangeNotifier {
     _isSpeakerEnabled = true;
     _isCameraMuted = false;
     _isVideoCall = false;
+    _stopAudioCapture();
+  }
+
+  // ── Audio Capture for Scam Detection ─────────────────────────────────────
+
+  void _startAudioCapture() async {
+    if (_audioCaptureService.isCapturing) return;
+
+    try {
+      final started = await _audioCaptureService.startCapture();
+      if (started) {
+        _audioStreamSubscription = _audioCaptureService.audioStream.listen(
+          (audioData) {
+            // Audio data available for STT and scam detection
+            debugPrint('🎤 Audio chunk received: ${audioData.length} bytes');
+          },
+          onError: (error) {
+            debugPrint('❌ Audio stream error: $error');
+          },
+        );
+        debugPrint('🎤 Audio capture started for scam detection');
+      }
+    } catch (e) {
+      debugPrint('❌ Failed to start audio capture: $e');
+    }
+  }
+
+  void _stopAudioCapture() async {
+    await _audioStreamSubscription?.cancel();
+    await _audioCaptureService.stopCapture();
+    debugPrint('🎤 Audio capture stopped');
   }
 
   @override
   void dispose() {
     _callDurationTimer?.cancel();
+    _audioStreamSubscription?.cancel();
+    _audioCaptureService.dispose();
     _engine?.release();
     super.dispose();
   }

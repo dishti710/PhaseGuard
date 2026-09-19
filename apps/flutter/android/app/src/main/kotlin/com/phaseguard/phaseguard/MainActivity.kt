@@ -1,6 +1,5 @@
 package com.phaseguard.phaseguard
 
-<<<<<<< HEAD
 import android.app.Activity
 import android.app.role.RoleManager
 import android.content.Context
@@ -33,28 +32,36 @@ class MainActivity : FlutterActivity() {
     private val BLUETOOTH_CHANNEL = "phaseguard/bluetooth_sco"
     private val DIALER_CHANNEL = "phaseguard/dialer"
     private val INCALL_CHANNEL = "phaseguard/incall_service"
-    
+    private val PHONE_STATE_CHANNEL = "phaseguard/phone_state"
+    private val PHONE_CONTROL_CHANNEL = "phaseguard/phone_control"
+    private val CALL_AUDIO_CHANNEL = "com.phaseguard/call_audio"
+    private val AUDIO_CONTROL_CHANNEL = "com.phaseguard/audio"
+
     private var mediaProjectionManager: MediaProjectionManager? = null
     private var sampleRate = 16000
     private var methodChannel: MethodChannel? = null
     private var bluetoothMethodChannel: MethodChannel? = null
     private var dialerMethodChannel: MethodChannel? = null
     private var inCallMethodChannel: MethodChannel? = null
-    
+    private var phoneControlMethodChannel: MethodChannel? = null
+    private var audioControlMethodChannel: MethodChannel? = null
+
     private var isCapturing = false
-    
+
     private var bluetoothScoCapture: BluetoothScoCapture? = null
-    // Shizuku capture disabled - not in scope for current implementation
-    // private var shizukuAudioCapture: ShizukuAudioCapture? = null
-    // private var recordingPriorityManager: RecordingPriorityManager? = null
     private var audioCaptureModule: AudioCaptureModule? = null
-    
+
+    // Phone call monitoring for remote audio capture
+    private var tracker: PhoneCallTracker? = null
+    private var speakerphoneService: SpeakerphoneAudioService? = null
+    private var callAudioEventSink: EventChannel.EventSink? = null
+
     // TelecomManager for call handling
     private var telecomManager: TelecomManager? = null
-    
+
     // Pending result for role/dialer request
     private var pendingDialerResult: MethodChannel.Result? = null
-    
+
     // Coroutine scope for async operations
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     
@@ -200,6 +207,89 @@ class MainActivity : FlutterActivity() {
         val audioCaptureMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "phaseguard/audio_capture")
         val audioCaptureEventChannel = EventChannel(flutterEngine.dartExecutor.binaryMessenger, "phaseguard/audio_capture_events")
         audioCaptureModule?.initialize(this, audioCaptureMethodChannel, audioCaptureEventChannel)
+
+        // ── Phone state events ──────────────────────────────────────────────────
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, PHONE_STATE_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    PhoneCallEmitter.sink = events
+                }
+                override fun onCancel(arguments: Any?) {
+                    PhoneCallEmitter.sink = null
+                }
+            })
+
+        // ── Phone control methods ───────────────────────────────────────────────
+        phoneControlMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, PHONE_CONTROL_CHANNEL)
+        phoneControlMethodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startMonitor" -> {
+                    startMonitor()
+                    result.success(true)
+                }
+                "stopMonitor" -> {
+                    stopMonitor()
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // ── Call audio capture stream (speakerphone fallback) ────────────────────
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, CALL_AUDIO_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    callAudioEventSink = events
+                    // Start speakerphone service
+                    val intent = Intent(this@MainActivity, SpeakerphoneAudioService::class.java)
+                    startService(intent)
+                    speakerphoneService = SpeakerphoneAudioService.getInstance()
+                    speakerphoneService?.setAudioCallback { chunk ->
+                        try {
+                            val encoded = android.util.Base64.encodeToString(chunk, android.util.Base64.NO_WRAP)
+                            callAudioEventSink?.success(encoded)
+                        } catch (e: Exception) {
+                            android.util.Log.e("MainActivity", "Failed to send audio chunk", e)
+                        }
+                    }
+                }
+                override fun onCancel(arguments: Any?) {
+                    callAudioEventSink = null
+                    speakerphoneService?.stopCapture()
+                }
+            })
+
+        // ── Audio control: start/stop call capture + speakerphone toggle ────────
+        audioControlMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUDIO_CONTROL_CHANNEL)
+        audioControlMethodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startCallCapture" -> {
+                    if (speakerphoneService == null) {
+                        speakerphoneService = SpeakerphoneAudioService.getInstance()
+                    }
+                    val started = speakerphoneService?.startCapture() ?: false
+                    result.success(started)
+                }
+                "stopCallCapture" -> {
+                    speakerphoneService?.stopCapture()
+                    result.success(true)
+                }
+                "isCallCaptureActive" -> {
+                    result.success(speakerphoneService?.isCapturing() ?: false)
+                }
+                "setSpeakerphone" -> {
+                    val on = call.argument<Boolean>("on") ?: false
+                    try {
+                        val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
+                        am.isSpeakerphoneOn = on
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.error("AUDIO_ERROR", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
         
         methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         methodChannel?.setMethodCallHandler { call, result ->
@@ -482,119 +572,15 @@ class MainActivity : FlutterActivity() {
             override fun notImplemented() {}
         })
         bluetoothScoCapture?.cleanup()
-        // Shizuku audio capture disabled - not in scope for current implementation
-        // shizukuAudioCapture?.cleanup()
         audioCaptureModule?.cleanup()
-    }
-    
-    companion object {
-        private const val SCREEN_CAPTURE_REQUEST_CODE = 1001
-        private const val REQUEST_DEFAULT_DIALER_CODE = 1002
-=======
-import android.content.Intent
-import android.os.Build
-import io.flutter.embedding.android.FlutterActivity
-import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.EventChannel
-import io.flutter.plugin.common.MethodChannel
 
-class MainActivity : FlutterActivity() {
-    private var tracker: PhoneCallTracker? = null
-    private var speakerphoneService: SpeakerphoneAudioService? = null
-    private var callAudioEventSink: EventChannel.EventSink? = null
-
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
-
-        // ── Phone state events ──────────────────────────────────────────────────
-        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "phaseguard/phone_state")
-            .setStreamHandler(object : EventChannel.StreamHandler {
-                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                    PhoneCallEmitter.sink = events
-                }
-                override fun onCancel(arguments: Any?) {
-                    PhoneCallEmitter.sink = null
-                }
-            })
-
-        // ── Phone control methods ───────────────────────────────────────────────
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "phaseguard/phone_control")
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "startMonitor" -> {
-                        startMonitor()
-                        result.success(true)
-                    }
-                    "stopMonitor" -> {
-                        stopMonitor()
-                        result.success(true)
-                    }
-                    else -> result.notImplemented()
-                }
-            }
-
-        // ── Call audio capture stream (speakerphone fallback) ────────────────────
-        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "com.phaseguard/call_audio")
-            .setStreamHandler(object : EventChannel.StreamHandler {
-                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                    callAudioEventSink = events
-                    // Start speakerphone service
-                    val intent = Intent(this@MainActivity, SpeakerphoneAudioService::class.java)
-                    startService(intent)
-                    speakerphoneService = SpeakerphoneAudioService.getInstance()
-                    speakerphoneService?.setAudioCallback { chunk ->
-                        try {
-                            val encoded = android.util.Base64.encodeToString(chunk, android.util.Base64.NO_WRAP)
-                            callAudioEventSink?.success(encoded)
-                        } catch (e: Exception) {
-                            android.util.Log.e("MainActivity", "Failed to send audio chunk", e)
-                        }
-                    }
-                }
-                override fun onCancel(arguments: Any?) {
-                    callAudioEventSink = null
-                    speakerphoneService?.stopCapture()
-                }
-            })
-
-        // ── Audio control: start/stop call capture + speakerphone toggle ────────
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.phaseguard/audio")
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "startCallCapture" -> {
-                        if (speakerphoneService == null) {
-                            speakerphoneService = SpeakerphoneAudioService.getInstance()
-                        }
-                        val started = speakerphoneService?.startCapture() ?: false
-                        result.success(started)
-                    }
-                    "stopCallCapture" -> {
-                        speakerphoneService?.stopCapture()
-                        result.success(true)
-                    }
-                    "isCallCaptureActive" -> {
-                        result.success(speakerphoneService?.isCapturing() ?: false)
-                    }
-                    "setSpeakerphone" -> {
-                        val on = call.argument<Boolean>("on") ?: false
-                        try {
-                            val am = getSystemService(AUDIO_SERVICE) as android.media.AudioManager
-                            am.isSpeakerphoneOn = on
-                            result.success(true)
-                        } catch (e: Exception) {
-                            result.error("AUDIO_ERROR", e.message, null)
-                        }
-                    }
-                    else -> result.notImplemented()
-                }
-            }
-    }
-
-    override fun onDestroy() {
+        // Cleanup phone monitoring
         speakerphoneService?.stopCapture()
         stopService(Intent(this, SpeakerphoneAudioService::class.java))
-        super.onDestroy()
+        stopMonitor()
     }
+
+    // ── Phone Monitoring Methods ───────────────────────────────────────────────
 
     private fun emitFromIntent(intent: Intent?) {
         val state = intent?.getStringExtra(CallMonitorService.EXTRA_STATE) ?: return
@@ -618,6 +604,10 @@ class MainActivity : FlutterActivity() {
         tracker?.stop()
         tracker = null
         stopService(Intent(this, CallMonitorService::class.java))
->>>>>>> dishti/feature/android-compose-ui
+    }
+    
+    companion object {
+        private const val SCREEN_CAPTURE_REQUEST_CODE = 1001
+        private const val REQUEST_DEFAULT_DIALER_CODE = 1002
     }
 }
