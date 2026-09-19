@@ -10,7 +10,12 @@ import '../models/protocol.dart';
 
 /// Same production host the React Native client uses.
 class ApiClient {
-  ApiClient({this.baseUrl = 'https://phaseguard.onrender.com'});
+  ApiClient({
+    this.baseUrl = const String.fromEnvironment(
+      'PHASEGUARD_BACKEND_URL',
+      defaultValue: 'https://phaseguard.onrender.com',
+    ),
+  });
 
   final String baseUrl;
 
@@ -35,11 +40,16 @@ class ApiClient {
     }
   }
 
-  Future<CallInitResult> initCall() async {
+  Future<CallInitResult> initCall({String? callerNumber}) async {
+    final body = <String, dynamic>{
+      'ingestion_mode': 'browser_mic',
+      if (callerNumber != null && callerNumber.isNotEmpty)
+        'caller_number': callerNumber,
+    };
     final res = await http.post(
       Uri.parse('$baseUrl/call/init'),
       headers: _headers(),
-      body: jsonEncode({'ingestion_mode': 'browser_mic'}),
+      body: jsonEncode(body),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw ApiException('Call init failed (${res.statusCode})');
@@ -130,7 +140,53 @@ class ApiClient {
       headers: _headers(token: token),
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
+      // The API returns 409 if already active or wrong state. Return it for handling.
+      if (res.statusCode == 409) return jsonDecode(res.body) as Map<String, dynamic>;
       throw ApiException(_detail(res) ?? 'Scambaiter activation failed');
+    }
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  /// Analyze scam text using the PhaseGuard backend (Layer 3 fallback)
+  Future<Map<String, dynamic>> analyzeScamText(String text) async {
+    final res = await http.post(
+      Uri.parse('$baseUrl/api/scam/analyze'),
+      headers: _headers(),
+      body: jsonEncode({'text': text, 'include_reasoning': true}),
+    );
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw ApiException(_detail(res) ?? 'Scam analysis failed');
+    }
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  /// Analyze deepfake audio using backend DSP layer
+  Future<Map<String, dynamic>> analyzeDeepfake(List<int> audioBytes) async {
+    final request = http.MultipartRequest('POST', Uri.parse('$baseUrl/api/deepfake/analyze'));
+    request.files.add(
+      http.MultipartFile.fromBytes('audio', audioBytes, filename: 'audio_sample.wav'),
+    );
+    final response = await request.send();
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException('Deepfake analysis failed (${response.statusCode})');
+    }
+    final res = await http.Response.fromStream(response);
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  /// Inject speech text to trigger STT, fact-checker and scambaiter
+  Future<Map<String, dynamic>> injectSpeech({
+    required String callId,
+    required String token,
+    required String text,
+  }) async {
+    final res = await http.post(
+      Uri.parse('$baseUrl/call/$callId/test_inject?text=${Uri.encodeQueryComponent(text)}'),
+      headers: _headers(token: token),
+      body: jsonEncode({}),
+    );
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw ApiException(_detail(res) ?? 'Speech injection failed');
     }
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
@@ -270,6 +326,7 @@ class ApiClient {
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
 
+<<<<<<< HEAD
   // ── Voice/TTS API Methods ─────────────────────────────────────────────────────
 
   /// Enroll a voice sample for cloning
@@ -452,6 +509,19 @@ class ApiClient {
     );
     if (res.statusCode < 200 || res.statusCode >= 300) {
       throw ApiException(_detail(res) ?? 'Detector info fetch failed');
+=======
+  /// Escalate directly to National Cyber Crime Portal (1930)
+  Future<Map<String, dynamic>> escalateToCybercell({
+    required String callId,
+    required String token,
+  }) async {
+    final res = await http.post(
+      Uri.parse('$baseUrl/call/$callId/escalate/cybercell'),
+      headers: _headers(token: token),
+    );
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw ApiException(_detail(res) ?? 'Cybercell escalation failed');
+>>>>>>> dishti/feature/android-compose-ui
     }
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
